@@ -1,0 +1,201 @@
+---
+title: "Map ROMS data to Ecopath GOA"
+author: "Alberto Rovellini"
+date: "5/11/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+Based on code from Owen Liu and Alberto Rovellini.
+
+# Purpose
+
+This document illustrates the workflow to pull static variables from ROMS NetCDF output and map it to the model area of Ecopath models for the Gulf of Alaska. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,include=FALSE}
+library(tidyverse)
+library(tidync)
+library(sf)
+library(rnaturalearth)
+library(raster)
+library(data.table)
+library(maps)
+library(mapdata)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+# Read data
+
+## Read Ecopath mask
+
+Load the Ecopath spatial masks.
+```{r}
+mask <- st_read("EGOA.shp")
+#mask <- mask %>% st_combine()
+```
+
+Have a look.
+```{r}
+coast <- map("worldHires", regions = "USA", plot = FALSE, fill = TRUE)
+coast <- coast %>% st_as_sf() %>% st_transform(crs = st_crs(mask)) %>% st_crop(st_bbox(mask))
+
+ggplot()+
+  geom_sf(data = mask, fill = "coral")+
+  geom_sf(data = coast, fill = "grey")+
+  theme_minimal()+
+  labs(title = "EGOA Ecopath mask")
+```
+
+## Import ROMS data
+
+For GOA, we have grid information stored in a grid file, and the variables stored in the netCDF files.
+```{r}
+roms_grid <- tidync("data/ROMS/CGOA_grid_5.nc")
+roms_vars <- tidync("data/ROMS/cgoa_avg_0793.nc")
+```
+
+Some information about this NetCDF.
+```{r}
+print(roms_vars)
+```
+
+Get variables. We do not need water velocity, so we can ignore $u$ and $v$ points. Also we should not need depth, so actually all that matters is 2D indexing for $\rho$ points.
+```{r}
+#grid info
+grid_variables <- hyper_grids(roms_grid) %>% # all available grids in the ROMS ncdf
+  pluck("grid") %>% # for each grid, pull out all the variables asssociated with that grid and make a reference table
+  purrr::map_df(function(x){
+    roms_grid %>% activate(x) %>% hyper_vars() %>% 
+      mutate(grd=x)
+  })
+
+#variables
+roms_variables <- hyper_grids(roms_vars) %>% # all available grids in the ROMS ncdf
+  pluck("grid") %>% # for each grid, pull out all the variables asssociated with that grid and make a reference table
+  purrr::map_df(function(x){
+    roms_vars %>% activate(x) %>% hyper_vars() %>% 
+      mutate(grd=x)
+  })
+```
+
+Get some information about time.
+```{r}
+ncmeta::nc_atts("data/ROMS/three_steps.nc", "ocean_time") %>% tidyr::unnest(cols = c(value))
+
+time_grid <- roms_variables %>% filter(name=="ocean_time") %>% pluck('grd')
+# pull the lon/lats
+time_steps <- roms_vars %>% activate(time_grid) %>% hyper_tibble() %>% mutate(ts=row_number()) # add index
+```
+
+```{r}
+# find appropriate ROMS ncdf grid for the rho points
+latlon_rhogrd <- grid_variables %>% filter(name=="lat_rho") %>% pluck('grd')
+# pull the lon/lats
+roms_rho <- roms_grid %>% activate(latlon_rhogrd) %>% hyper_tibble() %>% select(lon_rho,lat_rho,xi_rho,eta_rho) %>% 
+  mutate(rhoidx=row_number()) # add index
+```
+
+Add coordinates in the CRS used by the Ecopath mask.
+```{r}
+append_xy_coords <- function(lonlatdat, xyproj=crs(mask)@projargs, lon_col="lon_rho", lat_col="lat_rho"){
+  lonlatdat %>% 
+    st_as_sf(coords=c(lon_col, lat_col), crs=4326, remove=F) %>%  # convert to spatial object
+    st_transform(xyproj) %>%  # convert to Atlantis coords
+    mutate(x = st_coordinates(.)[,1],
+           y = st_coordinates(.)[,2]) # grab x and y coordinates and add them as attributes
+}
+
+rhoxy<- append_xy_coords(roms_rho,lon_col="lon_rho",lat_col="lat_rho") %>% mutate(rhoidx=row_number())
+```
+
+# Match ROMS and Ecopath
+
+Join $\rho$ points to the Ecopath mask. Do a spatial join.
+```{r}
+rho_join <- mask %>% st_join(rhoxy) %>% na.omit()
+```
+
+Test that we are pulling the right points.
+```{r}
+rho_join %>% 
+  st_set_geometry(NULL) %>% 
+  st_as_sf(coords = c("x", "y")) %>%
+  ggplot()+
+  geom_sf(size = 0.1)+
+  theme_minimal()+
+  labs(title = "CGOA 3K rho points overlapping with Ecopath mask")
+```
+
+# Pull variables from ROMS
+
+Need to pull time in this function, or else it will be a very large array. In addition, we may subset to the xi and eta identified from the join, instead of pulling out the entire array. Might be good for memory economy.
+```{r}
+rho_join <- rho_join %>% st_set_geometry(NULL)
+# function to pull ROMS data
+# for now, this should work with things like salt, temp, u, v, w
+# returns an array with all of the data from the one time-slice of ROMS
+pull_var <- function(variable,time_step){
+  grd <- roms_variables %>% filter(name==variable) %>% pluck('grd')
+  dat <- roms_vars %>% activate(grd) %>% 
+    hyper_filter(ocean_time = index == time_step) %>%
+    hyper_array()
+  return(dat[[variable]])
+}
+# index into the variable array using xi, eta, and s indices
+join_var <- function(a,xi,eta) a[xi,eta,]
+```
+
+Pull ROMS variables, once per time step. We could also subset spatially here, to make things faster, but it will take some thinking.
+```{r}
+roms_to_ecopath <- function(ts) {
+  # pull static variables for this time step (add variables if we want more, e.g. NPZ etc.)
+  salt <- pull_var('salt',ts)
+  temperature <- pull_var('temp',ts)
+  
+  # join rho points
+  roms_salt_temp <- rho_join %>% 
+    mutate(salt_vec=pmap(list(xi_rho,eta_rho),join_var,a=salt),
+           temp_vec=pmap(list(xi_rho,eta_rho),join_var,a=temperature))
+  
+  # Integrate over depth (average or sum, depending on the variable)
+  roms_salt_temp_int <- roms_salt_temp %>% mutate(salt = unlist(pmap(list(salt_vec),mean,na.tm=TRUE)),
+                                                  temp = unlist(pmap(list(temp_vec),mean,na.rm=TRUE)))
+  
+  # average over the area, or use other appropriate statistic (e.g. sum for NPZ variables, etc.)
+  salt_ts <- mean(roms_salt_temp_int$salt,na.rm=TRUE)
+  temp_ts <- mean(roms_salt_temp_int$temp,na.rm=TRUE)
+  
+  vars_ts <- data.frame(salt_ts,temp_ts)
+  return(vars_ts)
+}
+
+epoch <- "1900-01-01" #important, check that this is your correct start - keeping this generic as it changes a lot ROMS by ROMS
+
+ecopath_vars <- rbindlist(purrr::map(time_steps$ts,roms_to_ecopath))
+ecopath_vars <- ecopath_vars %>% mutate(time_step = 1:nrow(.),
+                                        date = as.POSIXct(time_steps$ocean_time, origin = epoch, tz = "GMT")) %>% select(time_step, date, temp_ts, salt_ts)
+```
+
+View.
+```{r}
+ecopath_vars %>%
+  pivot_longer(cols = ends_with("_ts"), names_to = "variable", values_to = "value") %>%
+  arrange(variable) %>% 
+  ggplot(aes(x = as.Date(date, format='%m/%d/%Y'), y = value))+
+  geom_point()+
+  geom_line()+
+  theme_minimal()+
+  facet_wrap(~variable, scales = "free")+
+  xlab("Day")+
+  ylab("Value")
+```

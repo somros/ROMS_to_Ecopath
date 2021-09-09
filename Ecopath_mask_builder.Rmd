@@ -1,0 +1,172 @@
+---
+title: "Ecopath mask builder"
+author: "Alberto Rovellini"
+date: "5/20/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+# Purpose
+
+Workflow to produce spatial masks for Ecopath GOA models from:
+
+1. NMFS statistical areas
+2. ETOPO depth raster
+
+Two spatial masks are produced: 
+
+1. For the Western and Central GOA Ecopath model: NMFS areas 610, 620, 630; from 0 to 1000 m depth.
+2. For the Eastern GOA Ecopath model: NMFS areas 640, 650; from 0 to 1000 m depth.
+
+```{r, include = FALSE}
+library(tidyverse)
+library(sf)
+library(raster)
+library(maps)
+library(mapdata)
+library(viridis)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+## Read data
+
+Read in statistical areas.
+```{r}
+nmfs <- st_read("data/shapefiles/gf95_nmfs/gf95_nmfs.shp")
+```
+
+```{r}
+nmfs <- nmfs %>% filter(NMFS_AREA %in% c(610,620,630,640,650)) %>% # subset to 610-650
+  filter(GF95_NMFS1 %in% c(186,194,259,585,870)) %>% select(NMFS_AREA, geometry)
+```
+
+Visualise.
+```{r}
+coast <- map("worldHires", regions = "USA", plot = FALSE, fill = TRUE)
+coast <- coast %>% st_as_sf() %>% st_transform(crs = st_crs(nmfs)) %>% st_crop(st_bbox(nmfs))
+
+ggplot()+
+  geom_sf(data = nmfs, fill = NA, color = "red")+
+  geom_sf_label(data = nmfs, aes(label = NMFS_AREA))+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs(title = "NMFS statistical areas")
+```
+This shapefile has three areas labelled 650. Two of them seem to be smaller than the rest. Are they all of interest for the Ecopath application?
+
+Read in depth raster.
+```{r}
+etopo <- raster("data/ETOPO1_Bed_c_gdal.grd/ETOPO1_Bed_c_gdal.grd")
+```
+Crop raster to extent of statistical areas (need to reproject that to 4326).
+```{r}
+nmfs_mask <- nmfs %>% st_transform(crs = 4326) %>% st_bbox() %>% extent() # get extent in 4326
+
+etopo_goa <-  crop(etopo, nmfs_mask) # resize the raster to the study area
+etopo_goa <- projectRaster(etopo_goa, crs = crs(nmfs)) # reproject
+```
+
+Visualise depth. Turn to sf for convenience.
+```{r}
+etopo_sf <- etopo_goa %>% 
+  rasterToPoints() %>% 
+  data.frame() %>% 
+  st_as_sf(coords = c("x","y"), crs = crs(nmfs)) %>% 
+  filter(layer < 0)
+
+etopo_sf <- etopo_sf[seq(1,nrow(etopo_sf),10),] # make this a little lighter for plotting
+
+ggplot()+
+  geom_sf(data = etopo_sf, aes(color = layer))+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs(title = "ETOPO depth")
+```
+
+## Process depth raster
+
+Process the depth raster to create a single polygon to be used as a mask for the NMFS areas. 
+
+1. Clip the raster with the NMFS areas.
+2. Subset the raster to the depth of interest (0-1000m).
+3. Reclassify the raster so that all cells have the same value (1).
+4. Polygonize the raster dissolving adjacent cells with equal values.
+5. Disaggregate non-adjacent polygons.
+6. Convert to sf object for ease of manipulation.
+7. Filter out the seamounts to keep the shelf only.
+```{r}
+#1
+etopo_nmfs <- mask(etopo_goa, nmfs)
+#2
+etopo_nmfs[etopo_nmfs[] < -1000] = NA
+#3
+etopo_nmfs <- etopo_nmfs %>% reclassify(rcl = c(-Inf, Inf, 1))
+#4 this step takes some time
+etopo_nmfs_pol <- etopo_nmfs %>% rasterToPolygons(dissolve = TRUE)
+#5
+etopo_nmfs_pols <- etopo_nmfs_pol %>% disaggregate()
+#6
+etopo_nmfs_sf <- etopo_nmfs_pols %>% st_as_sf() %>% mutate(index = 1:nrow(.))
+#7
+etopo_mask <- etopo_nmfs_sf[1,] # the main shelf polygon seems to be the first row
+```
+
+Visualise.
+```{r}
+ggplot()+
+  geom_sf(data = etopo_mask, fill = NA, color = "blue")+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs(title = "Depth mask (0-1000 m)")
+```
+
+Visualise with the NMFS areas.
+```{r}
+ggplot()+
+  geom_sf(data = etopo_mask, color = "blue", fill = NA)+
+  geom_sf(data = nmfs, fill = NA, color = "red")+
+  geom_sf_label(data = nmfs, aes(label = NMFS_AREA))+
+  geom_sf(data = coast)+
+  theme_minimal()
+```
+
+## Create spatial masks
+
+Intersect these, and add "WGOA" and "EGOA" column for the respective areas.
+```{r}
+ecopath <- etopo_mask %>% 
+  st_intersection(nmfs) %>% 
+  select(NMFS_AREA, geometry) %>%
+  rowwise() %>%
+  mutate(Model = ifelse(NMFS_AREA %in% c(640,650),"EGOA","WGOA"))
+
+ggplot()+
+  geom_sf(data = ecopath, aes(fill = Model))+
+  geom_sf(data = coast)+
+  theme_minimal()+
+  labs("Masks for Ecopath GOA models")
+```
+Does the WGOA Ecopath model push all the way into Cook Inlet?
+
+### Export as shapefiles
+
+Export the two masks separately.
+```{r, eval=FALSE}
+WGOA <- ecopath %>% filter(NMFS_AREA %in% c(610,620,630))
+EGOA <- ecopath %>% filter(NMFS_AREA %in% c(640,650))
+
+st_write(WGOA, "WGOA.shp", append = FALSE)
+st_write(EGOA, "EGOA.shp", append = FALSE)
+```
+
+**Note**: this could be refined. The current method produces a "jagged" contour of the mask along the 0 m and 1000 m isobaths, which is the result of converting the depth raster cells to a polygon mask. I think that for the purpose of approximating the area of the Ecopath models this is probably below rounding error, but I want to try and refine it at some point. It sould be a good placeholder for now.
